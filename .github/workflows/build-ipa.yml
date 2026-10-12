@@ -8,13 +8,13 @@ permissions:
 
 jobs:
   build:
-    # GhostGram versions.json specifies macOS 26 and Xcode 26.2.
     runs-on: macos-26-intel
     timeout-minutes: 360
     env:
       TG_API_ID: ${{ secrets.TG_API_ID }}
       TG_API_HASH: ${{ secrets.TG_API_HASH }}
       APP_BUNDLE_ID: org.ghostgram.ios
+
     steps:
       - name: Checkout source and submodules
         uses: actions/checkout@v7
@@ -22,33 +22,181 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Select required Xcode
+      - name: Configure unsigned device build and fix dav1d metadata
         shell: bash
         run: |
           set -euo pipefail
+
+          python3 - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+
+          # The upstream rules_apple rule rejects device builds without a profile,
+          # even though this workflow intentionally creates an unsigned IPA.
+          rules_file = Path(
+              "build-system/bazel-rules/rules_apple/apple/internal/ios_rules.bzl"
+          )
+          if not rules_file.is_file():
+              raise SystemExit(f"File not found: {rules_file}")
+
+          rules_source = rules_file.read_text(encoding="utf-8")
+          start_marker = "def _ios_application_impl(ctx):"
+          end_marker = "\ndef _ios_app_clip_impl(ctx):"
+          start = rules_source.find(start_marker)
+          end = rules_source.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit("Could not safely locate the iOS application rule in rules_apple.")
+
+          implementation = rules_source[start:end]
+          pattern = re.compile(
+              r"(?m)^([ \t]*)if platform_prerequisites\.platform\.is_device:\n"
+              r"\1    processor_partials\.append\(\n"
+              r"\1        partials\.provisioning_profile_partial\("
+          )
+
+          def replace_profile_check(match):
+              indent = match.group(1)
+              return (
+                  f"{indent}if platform_prerequisites.platform.is_device and provisioning_profile:\n"
+                  f"{indent}    processor_partials.append(\n"
+                  f"{indent}        partials.provisioning_profile_partial("
+              )
+
+          updated, count = pattern.subn(replace_profile_check, implementation, count=1)
+          if count != 1:
+              raise SystemExit(
+                  "Could not find the expected provisioning-profile check in _ios_application_impl."
+              )
+          rules_file.write_text(
+              rules_source[:start] + updated + rules_source[end:],
+              encoding="utf-8",
+          )
+          print("Patched the iOS application rule for an unsigned build.")
+
+          # dav1d's Bazel rule copies its source tree, including a .git file whose
+          # relative gitdir pointer becomes invalid after the copy. Embed the
+          # checked-out submodule commit in the generated VCS header instead.
+          dav1d_root = Path("third-party/dav1d/dav1d")
+          meson_file = dav1d_root / "include/meson.build"
+          if not meson_file.is_file():
+              raise SystemExit(f"File not found: {meson_file}")
+
+          revision = subprocess.check_output(
+              ["git", "-C", str(dav1d_root), "rev-parse", "--short", "HEAD"],
+              text=True,
+          ).strip()
+          if not re.fullmatch(r"[0-9a-fA-F]+", revision):
+              raise SystemExit(f"Unexpected dav1d revision: {revision!r}")
+
+          meson_source = meson_file.read_text(encoding="utf-8")
+          vcs_pattern = re.compile(
+              r"(?m)^dav1d_git_dir = join_paths\(dav1d_src_root, '\.git'\)\n"
+              r"^rev_target = vcs_tag\(command: \[\n"
+              r"^        'git', '--git-dir', dav1d_git_dir, 'describe', '--long', '--always'\n"
+              r"^    \],\n"
+              r"^    input: 'vcs_version\.h\.in',\n"
+              r"^    output: 'vcs_version\.h'\n"
+              r"^\)"
+          )
+          replacement = (
+              f"rev_target = vcs_tag(command: ['echo', '{revision}'],\n"
+              "    input: 'vcs_version.h.in',\n"
+              "    output: 'vcs_version.h'\n"
+              ")"
+          )
+          patched_meson, vcs_count = vcs_pattern.subn(replacement, meson_source, count=1)
+          if vcs_count == 1:
+              meson_file.write_text(patched_meson, encoding="utf-8")
+              print(f"Patched dav1d VCS header generation (revision {revision}).")
+          elif "rev_target = vcs_tag(command: ['echo'," in meson_source:
+              print("dav1d VCS header generation is already patched.")
+          else:
+              raise SystemExit(
+                  "Could not safely patch dav1d include/meson.build VCS generation."
+              )
+          PY
+
+      - name: Select required Xcode and repair SDK paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
           XCODE_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')"
           XCODE_APP="/Applications/Xcode_${XCODE_VERSION}.app"
+
           if [ ! -d "$XCODE_APP" ]; then
-            echo "::error::Xcode $XCODE_VERSION was not found on this runner. Installed Xcode apps:"
+            echo "::error::Xcode $XCODE_VERSION was not found on this runner."
             ls -ld /Applications/Xcode*.app 2>/dev/null || true
             exit 1
           fi
+
+          # Never delete installed Xcode applications on a hosted runner.
+          # Select the required one and let the build use its SDK directly.
           sudo xcode-select --switch "$XCODE_APP/Contents/Developer"
+          export DEVELOPER_DIR="$XCODE_APP/Contents/Developer"
+
           xcodebuild -version
+          echo "Active developer directory: $(xcode-select -p)"
           df -h /
-          # Free disk space by removing other installed Xcode versions only.
-          for APP in /Applications/Xcode*.app; do
-            if [ -d "$APP" ] && [ "$APP" != "$XCODE_APP" ]; then
-              sudo rm -rf "$APP"
-            fi
-          done
-          df -h /
+
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          if [ ! -d "$IOS_SDK" ]; then
+            echo "::error::iPhoneOS SDK was not found: $IOS_SDK"
+            exit 1
+          fi
+          echo "Using iPhoneOS SDK: $IOS_SDK"
+
+          # dav1d's cross-file had a hard-coded /Applications/Xcode.app path.
+          # Rewrite only that path to the SDK from the selected Xcode.
+          python3 - "$IOS_SDK" "$XCODE_APP/Contents/Developer" <<'PY'
+          import sys
+          from pathlib import Path
+
+          sdk_path = sys.argv[1]
+          developer_dir = sys.argv[2]
+          crossfile = Path(
+              "third-party/dav1d/dav1d/package/crossfiles/arm64-iPhoneOS.meson"
+          )
+          if not crossfile.is_file():
+              raise SystemExit(f"File not found: {crossfile}")
+
+          source = crossfile.read_text(encoding="utf-8")
+          old_sdk = (
+              "/Applications/Xcode.app/Contents/Developer/Platforms/"
+              "iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk"
+          )
+          old_root = (
+              "root = '/Applications/Xcode.app/Contents/Developer/Platforms/"
+              "iPhoneOS.platform/Developer'"
+          )
+          updated = source.replace(old_sdk, sdk_path)
+          updated = updated.replace(
+              old_root,
+              "root = '" + developer_dir
+              + "/Platforms/iPhoneOS.platform/Developer'",
+          )
+
+          if updated == source:
+              # It may already use the selected SDK; only fail if it still points
+              # to the old Xcode.app path for the SDK/root.
+              if old_sdk in source or old_root in source:
+                  raise SystemExit(
+                      "Failed to update dav1d's hard-coded Xcode SDK paths."
+                  )
+              print("dav1d cross-file already uses a non-legacy SDK path.")
+          else:
+              crossfile.write_text(updated, encoding="utf-8")
+              print(f"Updated dav1d cross-file to use {sdk_path}.")
+          PY
 
       - name: Prepare Bazel and app configuration
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
+          import json
           import os
           import sys
           from pathlib import Path
@@ -63,14 +211,17 @@ jobs:
 
           sys.path.insert(0, str(Path("build-system/Make").resolve()))
           from BazelLocation import locate_bazel
-          import json
 
           bazel_path = locate_bazel(
-              base_path=os.getcwd(), cache_host_or_path=None, cache_dir=None
+              base_path=os.getcwd(),
+              cache_host_or_path=None,
+              cache_dir=None,
           )
+
           config_dir = Path("build-input/configuration-repository")
           provisioning_dir = config_dir / "provisioning"
           provisioning_dir.mkdir(parents=True, exist_ok=True)
+
           (config_dir / "WORKSPACE").write_text("", encoding="utf-8")
           (config_dir / "MODULE.bazel").write_text(
               'module(name = "build_configuration",)\n', encoding="utf-8"
@@ -80,7 +231,6 @@ jobs:
               "exports_files([])\n", encoding="utf-8"
           )
 
-          # The app is built without Apple's provisioning profiles; the IPA is signed later by Sideloadly.
           values = [
               f"telegram_bazel_path = {json.dumps(bazel_path)}",
               "telegram_use_xcode_managed_codesigning = False",
@@ -99,7 +249,10 @@ jobs:
               "telegram_enable_icloud = False",
               "telegram_enable_watch = True",
           ]
-          (config_dir / "variables.bzl").write_text("\n".join(values) + "\n", encoding="utf-8")
+
+          (config_dir / "variables.bzl").write_text(
+              "\n".join(values) + "\n", encoding="utf-8"
+          )
           print("Prepared Bazel and app build configuration.")
           PY
 
@@ -107,17 +260,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           BAZEL="$(find build-input -maxdepth 1 -type f -name 'bazel-*-darwin-x86_64' -print -quit)"
           if [ -z "$BAZEL" ]; then
             echo "::error::The Bazel binary was not downloaded."
             exit 1
           fi
+
           chmod +x "$BAZEL"
+          APP_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["app"])')"
+          echo "Building GhostGram version: $APP_VERSION"
+
           "$BAZEL" build Telegram/Telegram \
             --announce_rc \
             --features=swift.use_global_module_cache \
+            --features=disable_legacy_signing \
             --verbose_failures \
             --define=buildNumber=1 \
+            --define="telegramVersion=$APP_VERSION" \
             -c opt \
             --ios_multi_cpus=arm64 \
             --watchos_cpus=arm64_32 \
@@ -125,9 +285,19 @@ jobs:
             --//Telegram:disableProvisioningProfiles \
             --@build_bazel_rules_swift//swift:copt="-j" \
             --@build_bazel_rules_swift//swift:copt="4"
-          test -f bazel-bin/Telegram/Telegram.ipa
+
+          IPA_SOURCE="bazel-bin/Telegram/Telegram.ipa"
+          if [ ! -f "$IPA_SOURCE" ]; then
+            IPA_SOURCE="$(find -L bazel-out -type f -path '*/bin/Telegram/Telegram.ipa' -print -quit || true)"
+          fi
+          if [ -z "$IPA_SOURCE" ] || [ ! -f "$IPA_SOURCE" ]; then
+            echo "::error::Build finished but Telegram.ipa was not found in Bazel outputs."
+            find -L bazel-out -type f -name '*.ipa' -print 2>/dev/null || true
+            exit 1
+          fi
+
           mkdir -p build-artifacts/release-ipa
-          cp -f bazel-bin/Telegram/Telegram.ipa build-artifacts/release-ipa/GhostGram.ipa
+          cp -f "$IPA_SOURCE" build-artifacts/release-ipa/GhostGram.ipa
           ls -lh build-artifacts/release-ipa/GhostGram.ipa
 
       - name: Upload IPA artifact
