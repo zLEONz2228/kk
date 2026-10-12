@@ -11,6 +11,7 @@ jobs:
   build:
     runs-on: macos-26-intel
     timeout-minutes: 360
+
     env:
       TG_API_ID: ${{ secrets.TG_API_ID }}
       TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -23,6 +24,53 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Configure unsigned device build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "build-system/bazel-rules/rules_apple/"
+              "apple/internal/ios_rules.bzl"
+          )
+
+          if not path.is_file():
+              raise SystemExit(
+                  f"Cannot find rules_apple source: {path}"
+              )
+
+          source = path.read_text(encoding="utf-8")
+
+          old = (
+              "if platform_prerequisites.platform.is_device:\n"
+              "        processor_partials.append(\n"
+              "            partials.provisioning_profile_partial("
+          )
+
+          new = (
+              "if platform_prerequisites.platform.is_device and provisioning_profile:\n"
+              "        processor_partials.append(\n"
+              "            partials.provisioning_profile_partial("
+          )
+
+          count = source.count(old)
+
+          if count != 1:
+              raise SystemExit(
+                  "Could not safely patch rules_apple: "
+                  f"expected exactly one matching block, found {count}."
+              )
+
+          path.write_text(
+              source.replace(old, new, 1),
+              encoding="utf-8"
+          )
+
+          print("Configured device build without an embedded provisioning profile.")
+
       - name: Select required Xcode
         shell: bash
         run: |
@@ -32,7 +80,7 @@ jobs:
           XCODE_APP="/Applications/Xcode_${XCODE_VERSION}.app"
 
           if [ ! -d "$XCODE_APP" ]; then
-            echo "::error::Xcode $XCODE_VERSION was not found on this runner."
+            echo "::error::Xcode $XCODE_VERSION was not found."
             ls -ld /Applications/Xcode*.app 2>/dev/null || true
             exit 1
           fi
@@ -66,10 +114,13 @@ jobs:
           if not api_id or not api_hash:
               raise SystemExit(
                   "Missing TG_API_ID or TG_API_HASH. Add both under "
-                  "GitHub repository Settings > Secrets and variables > Actions."
+                  "Settings > Secrets and variables > Actions."
               )
 
-          sys.path.insert(0, str(Path("build-system/Make").resolve()))
+          sys.path.insert(
+              0, str(Path("build-system/Make").resolve())
+          )
+
           from BazelLocation import locate_bazel
 
           bazel_path = locate_bazel(
@@ -82,12 +133,16 @@ jobs:
           provisioning_dir = config_dir / "provisioning"
           provisioning_dir.mkdir(parents=True, exist_ok=True)
 
-          (config_dir / "WORKSPACE").write_text("", encoding="utf-8")
+          (config_dir / "WORKSPACE").write_text(
+              "", encoding="utf-8"
+          )
           (config_dir / "MODULE.bazel").write_text(
               'module(name = "build_configuration",)\n',
               encoding="utf-8"
           )
-          (config_dir / "BUILD").write_text("", encoding="utf-8")
+          (config_dir / "BUILD").write_text(
+              "", encoding="utf-8"
+          )
           (provisioning_dir / "BUILD").write_text(
               "exports_files([])\n",
               encoding="utf-8"
@@ -135,11 +190,13 @@ jobs:
           chmod +x "$BAZEL"
 
           APP_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["app"])')"
+
           echo "Building GhostGram version: $APP_VERSION"
 
           "$BAZEL" build Telegram/Telegram \
             --announce_rc \
             --features=swift.use_global_module_cache \
+            --features=disable_legacy_signing \
             --verbose_failures \
             --define=buildNumber=1 \
             --define="telegramVersion=$APP_VERSION" \
@@ -154,7 +211,10 @@ jobs:
           test -f bazel-bin/Telegram/Telegram.ipa
 
           mkdir -p build-artifacts/release-ipa
-          cp -f bazel-bin/Telegram/Telegram.ipa build-artifacts/release-ipa/GhostGram.ipa
+
+          cp -f \
+            bazel-bin/Telegram/Telegram.ipa \
+            build-artifacts/release-ipa/GhostGram.ipa
 
           ls -lh build-artifacts/release-ipa/GhostGram.ipa
 
