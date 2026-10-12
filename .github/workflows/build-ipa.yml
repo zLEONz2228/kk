@@ -11,7 +11,6 @@ jobs:
   build:
     runs-on: macos-26-intel
     timeout-minutes: 360
-
     env:
       TG_API_ID: ${{ secrets.TG_API_ID }}
       TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -30,6 +29,7 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
           path = Path(
@@ -38,38 +38,60 @@ jobs:
           )
 
           if not path.is_file():
-              raise SystemExit(
-                  f"Cannot find rules_apple source: {path}"
-              )
+              raise SystemExit(f"File not found: {path}")
 
           source = path.read_text(encoding="utf-8")
+          start_marker = "def _ios_application_impl(ctx):"
+          end_marker = "\ndef _ios_app_clip_impl(ctx):"
 
-          old = (
-              "if platform_prerequisites.platform.is_device:\n"
-              "        processor_partials.append(\n"
-              "            partials.provisioning_profile_partial("
+          start = source.find(start_marker)
+          if start < 0:
+              raise SystemExit(
+                  "Could not find _ios_application_impl in ios_rules.bzl"
+              )
+
+          end = source.find(end_marker, start)
+          if end < 0:
+              raise SystemExit(
+                  "Could not find the end of _ios_application_impl"
+              )
+
+          implementation = source[start:end]
+
+          pattern = re.compile(
+              r"(?m)^([ \t]*)if platform_prerequisites\.platform\.is_device:\n"
+              r"\1    processor_partials\.append\(\n"
+              r"\1        partials\.provisioning_profile_partial\("
           )
 
-          new = (
-              "if platform_prerequisites.platform.is_device and provisioning_profile:\n"
-              "        processor_partials.append(\n"
-              "            partials.provisioning_profile_partial("
-          )
+          def replace_block(match):
+              indent = match.group(1)
+              return (
+                  f"{indent}if platform_prerequisites.platform.is_device and provisioning_profile:\n"
+                  f"{indent}    processor_partials.append(\n"
+                  f"{indent}        partials.provisioning_profile_partial("
+              )
 
-          count = source.count(old)
+          patched, count = pattern.subn(
+              replace_block, implementation, count=1
+          )
 
           if count != 1:
               raise SystemExit(
-                  "Could not safely patch rules_apple: "
-                  f"expected exactly one matching block, found {count}."
+                  "Could not safely patch the provisioning-profile check "
+                  "inside _ios_application_impl. No changes were written."
               )
 
           path.write_text(
-              source.replace(old, new, 1),
+              source[:start] + patched + source[end:],
               encoding="utf-8"
           )
 
-          print("Configured device build without an embedded provisioning profile.")
+          print(
+              "Patched only the iOS application "
+              "provisioning-profile check."
+          )
+          PY
 
       - name: Select required Xcode
         shell: bash
@@ -80,7 +102,7 @@ jobs:
           XCODE_APP="/Applications/Xcode_${XCODE_VERSION}.app"
 
           if [ ! -d "$XCODE_APP" ]; then
-            echo "::error::Xcode $XCODE_VERSION was not found."
+            echo "::error::Xcode $XCODE_VERSION was not found on this runner."
             ls -ld /Applications/Xcode*.app 2>/dev/null || true
             exit 1
           fi
@@ -103,9 +125,9 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
+          import json
           import os
           import sys
-          import json
           from pathlib import Path
 
           api_id = os.environ.get("TG_API_ID", "").strip()
@@ -114,19 +136,18 @@ jobs:
           if not api_id or not api_hash:
               raise SystemExit(
                   "Missing TG_API_ID or TG_API_HASH. Add both under "
-                  "Settings > Secrets and variables > Actions."
+                  "GitHub repository Settings > Secrets and variables > Actions."
               )
 
           sys.path.insert(
               0, str(Path("build-system/Make").resolve())
           )
-
           from BazelLocation import locate_bazel
 
           bazel_path = locate_bazel(
               base_path=os.getcwd(),
               cache_host_or_path=None,
-              cache_dir=None
+              cache_dir=None,
           )
 
           config_dir = Path("build-input/configuration-repository")
@@ -138,14 +159,14 @@ jobs:
           )
           (config_dir / "MODULE.bazel").write_text(
               'module(name = "build_configuration",)\n',
-              encoding="utf-8"
+              encoding="utf-8",
           )
           (config_dir / "BUILD").write_text(
               "", encoding="utf-8"
           )
           (provisioning_dir / "BUILD").write_text(
               "exports_files([])\n",
-              encoding="utf-8"
+              encoding="utf-8",
           )
 
           values = [
@@ -169,7 +190,7 @@ jobs:
 
           (config_dir / "variables.bzl").write_text(
               "\n".join(values) + "\n",
-              encoding="utf-8"
+              encoding="utf-8",
           )
 
           print("Prepared Bazel and app build configuration.")
@@ -190,7 +211,6 @@ jobs:
           chmod +x "$BAZEL"
 
           APP_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["app"])')"
-
           echo "Building GhostGram version: $APP_VERSION"
 
           "$BAZEL" build Telegram/Telegram \
