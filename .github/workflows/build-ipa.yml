@@ -1,3 +1,4 @@
+
 name: Build GhostGram IPA
 
 on:
@@ -8,13 +9,13 @@ permissions:
 
 jobs:
   build:
-    # GhostGram versions.json specifies macOS 26 and Xcode 26.2.
     runs-on: macos-26-intel
     timeout-minutes: 360
     env:
       TG_API_ID: ${{ secrets.TG_API_ID }}
       TG_API_HASH: ${{ secrets.TG_API_HASH }}
       APP_BUNDLE_ID: org.ghostgram.ios
+
     steps:
       - name: Checkout source and submodules
         uses: actions/checkout@v7
@@ -26,35 +27,42 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           XCODE_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')"
           XCODE_APP="/Applications/Xcode_${XCODE_VERSION}.app"
+
           if [ ! -d "$XCODE_APP" ]; then
-            echo "::error::Xcode $XCODE_VERSION was not found on this runner. Installed Xcode apps:"
+            echo "::error::Xcode $XCODE_VERSION was not found on this runner."
             ls -ld /Applications/Xcode*.app 2>/dev/null || true
             exit 1
           fi
+
           sudo xcode-select --switch "$XCODE_APP/Contents/Developer"
           xcodebuild -version
           df -h /
-          # Free disk space by removing other installed Xcode versions only.
+
           for APP in /Applications/Xcode*.app; do
             if [ -d "$APP" ] && [ "$APP" != "$XCODE_APP" ]; then
               sudo rm -rf "$APP"
             fi
           done
+
           df -h /
 
       - name: Prepare Bazel and app configuration
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import os
           import sys
+          import json
           from pathlib import Path
 
           api_id = os.environ.get("TG_API_ID", "").strip()
           api_hash = os.environ.get("TG_API_HASH", "").strip()
+
           if not api_id or not api_hash:
               raise SystemExit(
                   "Missing TG_API_ID or TG_API_HASH. Add both under "
@@ -63,24 +71,28 @@ jobs:
 
           sys.path.insert(0, str(Path("build-system/Make").resolve()))
           from BazelLocation import locate_bazel
-          import json
 
           bazel_path = locate_bazel(
-              base_path=os.getcwd(), cache_host_or_path=None, cache_dir=None
+              base_path=os.getcwd(),
+              cache_host_or_path=None,
+              cache_dir=None
           )
+
           config_dir = Path("build-input/configuration-repository")
           provisioning_dir = config_dir / "provisioning"
           provisioning_dir.mkdir(parents=True, exist_ok=True)
+
           (config_dir / "WORKSPACE").write_text("", encoding="utf-8")
           (config_dir / "MODULE.bazel").write_text(
-              'module(name = "build_configuration",)\n', encoding="utf-8"
+              'module(name = "build_configuration",)\n',
+              encoding="utf-8"
           )
           (config_dir / "BUILD").write_text("", encoding="utf-8")
           (provisioning_dir / "BUILD").write_text(
-              "exports_files([])\n", encoding="utf-8"
+              "exports_files([])\n",
+              encoding="utf-8"
           )
 
-          # The app is built without Apple's provisioning profiles; the IPA is signed later by Sideloadly.
           values = [
               f"telegram_bazel_path = {json.dumps(bazel_path)}",
               "telegram_use_xcode_managed_codesigning = False",
@@ -99,7 +111,12 @@ jobs:
               "telegram_enable_icloud = False",
               "telegram_enable_watch = True",
           ]
-          (config_dir / "variables.bzl").write_text("\n".join(values) + "\n", encoding="utf-8")
+
+          (config_dir / "variables.bzl").write_text(
+              "\n".join(values) + "\n",
+              encoding="utf-8"
+          )
+
           print("Prepared Bazel and app build configuration.")
           PY
 
@@ -107,17 +124,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           BAZEL="$(find build-input -maxdepth 1 -type f -name 'bazel-*-darwin-x86_64' -print -quit)"
+
           if [ -z "$BAZEL" ]; then
             echo "::error::The Bazel binary was not downloaded."
             exit 1
           fi
+
           chmod +x "$BAZEL"
+
+          APP_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["app"])')"
+          echo "Building GhostGram version: $APP_VERSION"
+
           "$BAZEL" build Telegram/Telegram \
             --announce_rc \
             --features=swift.use_global_module_cache \
             --verbose_failures \
             --define=buildNumber=1 \
+            --define="telegramVersion=$APP_VERSION" \
             -c opt \
             --ios_multi_cpus=arm64 \
             --watchos_cpus=arm64_32 \
@@ -125,9 +150,12 @@ jobs:
             --//Telegram:disableProvisioningProfiles \
             --@build_bazel_rules_swift//swift:copt="-j" \
             --@build_bazel_rules_swift//swift:copt="4"
+
           test -f bazel-bin/Telegram/Telegram.ipa
+
           mkdir -p build-artifacts/release-ipa
           cp -f bazel-bin/Telegram/Telegram.ipa build-artifacts/release-ipa/GhostGram.ipa
+
           ls -lh build-artifacts/release-ipa/GhostGram.ipa
 
       - name: Upload IPA artifact
